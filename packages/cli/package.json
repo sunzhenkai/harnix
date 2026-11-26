@@ -1,0 +1,26 @@
+{
+  "name": "@harnix/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Example CLI demonstrating @harnix/core with Native, Pi, and ACP harnesses.",
+  "bin": {
+    "harnix": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@harnix/acp": "workspace:*",
+    "@harnix/core": "workspace:*",
+    "@harnix/native": "workspace:*",
+    "@harnix/pi": "workspace:*"
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json && chmod +x dist/bin.js"
+  }
+}

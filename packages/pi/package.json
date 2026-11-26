@@ -1,0 +1,21 @@
+{
+  "name": "@harnix/pi",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi AI Harness adapter implementing the unified @harnix/core Harness interface.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@harnix/core": "workspace:*",
+    "@mariozechner/pi-ai": "^0.73.1"
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  }
+}

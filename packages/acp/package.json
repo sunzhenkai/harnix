@@ -1,0 +1,20 @@
+{
+  "name": "@harnix/acp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "ACP (Agent Client Protocol) stdio JSON-RPC 2.0 adapter implementing the @harnix/core Harness interface.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@harnix/core": "workspace:*"
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  }
+}

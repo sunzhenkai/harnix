@@ -1,0 +1,20 @@
+{
+  "name": "@harnix/native",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Hand-crafted fetch-based Harness supporting OpenAI-compatible and Anthropic APIs with streaming and tool loops.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@harnix/core": "workspace:*"
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  }
+}

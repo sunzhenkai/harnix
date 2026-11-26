@@ -1,0 +1,17 @@
+{
+  "name": "@harnix/core",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Unified Agent Harness interfaces, events, tool/permission contracts, and runtime helpers.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  }
+}

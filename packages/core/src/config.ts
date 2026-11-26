@@ -33,6 +33,8 @@ export interface HarnessDescriptor {
 }
 
 export interface NativeHarnessSettings {
+  readonly providerInstanceId?: string;
+  readonly model?: string;
   readonly temperature?: number;
   readonly maxTokens?: number;
   readonly maxTurns: number;
@@ -44,6 +46,8 @@ export interface NativeHarnessSettings {
 }
 
 export interface PiHarnessSettings {
+  readonly providerInstanceId?: string;
+  readonly model?: string;
   readonly reasoning: boolean;
   readonly contextWindow: number;
   readonly maxTokens: number;
@@ -197,6 +201,12 @@ function asString(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback;
 }
 
+function asOptionalNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function asStringArray(value: unknown, fallback: readonly string[]): string[] {
   if (!Array.isArray(value)) return [...fallback];
   return value.filter((item): item is string => typeof item === 'string');
@@ -311,6 +321,12 @@ export function normalizeHarnixSettings(input?: unknown): HarnixSettings {
     version: 1,
     defaultKind: normalizeHarnessKind(rawObj['defaultKind'], defaults.defaultKind),
     native: {
+      ...(asOptionalNonEmptyString(rawNative['providerInstanceId']) !== undefined
+        ? { providerInstanceId: asOptionalNonEmptyString(rawNative['providerInstanceId']) }
+        : {}),
+      ...(asOptionalNonEmptyString(rawNative['model']) !== undefined
+        ? { model: asOptionalNonEmptyString(rawNative['model']) }
+        : {}),
       ...(asOptionalNumber(rawNative['temperature']) !== undefined
         ? { temperature: asOptionalNumber(rawNative['temperature']) }
         : {}),
@@ -331,6 +347,12 @@ export function normalizeHarnixSettings(input?: unknown): HarnixSettings {
       ),
     },
     pi: {
+      ...(asOptionalNonEmptyString(rawPi['providerInstanceId']) !== undefined
+        ? { providerInstanceId: asOptionalNonEmptyString(rawPi['providerInstanceId']) }
+        : {}),
+      ...(asOptionalNonEmptyString(rawPi['model']) !== undefined
+        ? { model: asOptionalNonEmptyString(rawPi['model']) }
+        : {}),
       reasoning: asBoolean(rawPi['reasoning'], defaults.pi.reasoning),
       contextWindow: asNumber(rawPi['contextWindow'], defaults.pi.contextWindow),
       maxTokens: asNumber(rawPi['maxTokens'], defaults.pi.maxTokens),

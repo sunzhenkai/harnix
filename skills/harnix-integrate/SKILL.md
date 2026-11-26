@@ -34,8 +34,10 @@ description: 将 harnix 统一 Agent Harness 框架（native / pi / acp）集成
 - **完成标志**：宿主可执行 `npm ci` / `pnpm install` 正常解析 `harnix` 与 `@harnix/*` 类型及运行时。
 
 ### 步骤 3：新增 Harness 设置体系（核心）
-读取 [references/settings-architecture.md](references/settings-architecture.md)，落地「默认实现选择 + 按 `native` / `pi` / `acp` 分实现差异化配置 + 连通性探针」的完整前后端设置体系。
-- **完成标志**：后端提供 `HarnixSettings` 归一化/校验/脱敏读写与 `descriptors`/`check` 接口；前端设置页可切换默认实现并独立编辑三类差异化参数、执行连通性探测；会话页支持展示与切换当前会话的 Harness 实现。
+读取 [references/settings-architecture.md](references/settings-architecture.md)，落地「单选择器按实现动态展示 + 切走保旧/切回还原 + 与模型设置同页整合且联动 + 连通性探针」的完整前后端设置体系：
+- **单选择器按实现展示**：设置页只保留一个 Harness 实现选择器，仅渲染当前选中实现的配置；切换实现前先把旧实现的未提交草稿写入 `harnix_settings[prevKind]` 并原子保存，切回时完整还原（含各自模型绑定与参数）；**禁止**用独立无联动的 Tabs 割裂默认实现与配置表单。
+- **与模型/Provider 同页整合且联动**：将 Harness 设置与 Provider 实例、模型选择整合在同一设置页（如 `/settings/models`）；`native` / `pi` 在面板内直接绑定各自 `providerInstanceId` 与 `model` 并联动探测，`acp` 隐藏对话侧模型选择并改为展示 ACP Agent 配置（同时保留后台任务模型独立可用）。
+- **完成标志**：后端提供 `HarnixSettings` 归一化/校验/脱敏读写、分实现模型解析与 `descriptors`/`check` 接口；前端模型与 Harness 同页联动、往返切换不丢配置；会话页同步联动。
 
 ### 步骤 4：构建薄桥接层（Runtime / Tools / Events / Permissions）
 读取 [references/runtime-bridge.md](references/runtime-bridge.md)，在宿主新建薄桥接目录（如 `src/harness/`），实现：

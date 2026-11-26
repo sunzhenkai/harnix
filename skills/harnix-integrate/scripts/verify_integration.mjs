@@ -223,6 +223,40 @@ async function main() {
         message: 'Frontend web/src includes harnix_settings and native/pi/acp UI',
       });
     }
+
+    const modelsSettingsPath = path.join(webSrcDir, 'pages', 'settings', 'models.tsx');
+    if (await fileExists(modelsSettingsPath)) {
+      const modelsContent = await fs.readFile(modelsSettingsPath, 'utf8');
+      const harnessSettingsPath = path.join(webSrcDir, 'pages', 'settings', 'harness.tsx');
+      const harnessContent = (await fileExists(harnessSettingsPath))
+        ? await fs.readFile(harnessSettingsPath, 'utf8')
+        : '';
+
+      const colocated =
+        modelsContent.includes('Harness') || modelsContent.includes('harnix_settings');
+      const hasSplitTabs =
+        harnessContent.includes('<Tabs') && harnessContent.includes('TabsList');
+
+      if (!colocated) {
+        checks.push({
+          id: 'frontend_harness_model_colocation',
+          status: 'fail',
+          message: 'web/src/pages/settings/models.tsx must co-locate and couple Harness settings with Model/Provider settings',
+        });
+      } else if (hasSplitTabs) {
+        checks.push({
+          id: 'frontend_harness_model_colocation',
+          status: 'fail',
+          message: 'web/src/pages/settings/harness.tsx must use single active-kind selection instead of disconnected Tabs/TabsList',
+        });
+      } else {
+        checks.push({
+          id: 'frontend_harness_model_colocation',
+          status: 'pass',
+          message: 'Model and Harness settings are co-located in models.tsx without disconnected Tabs',
+        });
+      }
+    }
   }
 
   const ok = checks.every((c) => c.status !== 'fail');

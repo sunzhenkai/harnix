@@ -21,7 +21,8 @@
 
 5. **前端设置页与会话交互验证**
    - 前端 `typecheck`、`lint`、单元测试、`build` 及项目自有设计规范检查全部通过。
-   - `/settings/harness` 可切换默认实现并分别保存 `native` / `pi` / `acp` 配置及触发连通性检查；会话页可切换三种 Harness 实现。
+   - `/settings/models`（「模型与 Harness」）同页整合 Provider 实例、对话 Harness 与模型、后台任务模型；旧 `/settings/harness` 路由正常重定向至 `/settings/models`。
+   - 仅保留单 Harness 实现选择器并按选中实现动态渲染配置；按 `native` → `pi` → `acp` → `native` 往返切换后，各实现的参数与各自绑定的 `providerInstanceId`/`model` 完整保留并还原；`acp` 选中时隐藏对话侧模型选择；会话页同步联动（`acp` 隐藏 `ModelPicker`，切换 `native` ↔ `pi` 自动带入对应模型）。
 
 6. **旧链路清理确认（仅 `migrate` 路径）**
    - 确认已被替代的自研运行时与协议/进程管理代码已移除，代码库无残余引用。

@@ -178,6 +178,42 @@ describe('@harnix/core', () => {
     ]);
   });
 
+  it('preserves per-implementation model bindings across defaultKind switches and strips blanks', () => {
+    const step1 = normalizeHarnixSettings({
+      defaultKind: 'native',
+      native: {
+        providerInstanceId: ' inst_openai ',
+        model: ' gpt-5 ',
+        maxTurns: 12,
+      },
+      pi: {
+        providerInstanceId: 'inst_anthropic',
+        model: 'claude-sonnet-4',
+        reasoning: true,
+      },
+    });
+    expect(step1.native.providerInstanceId).toBe('inst_openai');
+    expect(step1.native.model).toBe('gpt-5');
+    expect(step1.pi.providerInstanceId).toBe('inst_anthropic');
+    expect(step1.pi.model).toBe('claude-sonnet-4');
+
+    const step2 = normalizeHarnixSettings({ ...step1, defaultKind: 'acp' });
+    expect(step2.defaultKind).toBe('acp');
+    expect(step2.native.providerInstanceId).toBe('inst_openai');
+    expect(step2.native.maxTurns).toBe(12);
+    expect(step2.pi.providerInstanceId).toBe('inst_anthropic');
+    expect(step2.pi.reasoning).toBe(true);
+
+    const blanked = normalizeHarnixSettings({
+      native: { providerInstanceId: '   ', model: '' },
+      pi: { providerInstanceId: '', model: '   ' },
+    });
+    expect('providerInstanceId' in blanked.native).toBe(false);
+    expect('model' in blanked.native).toBe(false);
+    expect('providerInstanceId' in blanked.pi).toBe(false);
+    expect('model' in blanked.pi).toBe(false);
+  });
+
   it('enforces policy permissions and runToolLoop per-turn limits & onDebug', async () => {
     const readonlyHandler = createPermissionHandlerForMode('readonly');
     const signal = new AbortController().signal;

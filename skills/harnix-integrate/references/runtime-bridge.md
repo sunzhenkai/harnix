@@ -9,15 +9,16 @@
   - 发消息前调用 `acpHarness.hasSessionCapacity(sessionId)`，无容量时返回 HTTP `503` + `Retry-After`。
   - 会话删除或归档时调用 `acpHarness.closeSession(sessionId)` 释放子进程。
   - 配置变更或服务关闭时调用 `acpHarness.close()` 清理全部子进程。
+  - 宿主应用工厂（如 `createApp`）在未显式注入管理器时可默认创建一个 `HarnessManager` 实例，保证集成测试与单测开箱可用。
 
 ## 2. 工具包装（`HarnessTool`）
 
-将宿主现有工具定义与执行器包装为 `HarnessTool[]`：
+将宿主现有工具定义与执行器包装为 `HarnessTool[]`（注意部分宿主旧工具定义的 `parameters` 可能为 `null`，需兜底 `{ type: 'object' }`）：
 ```ts
 const harnessTools: HarnessTool[] = hostTools.map((tool) => ({
   name: tool.name,
   description: tool.description,
-  parameters: tool.parameters,
+  parameters: tool.parameters ?? { type: 'object' },
   async execute(args, context) {
     try {
       const output = await hostExecutor.execute(tool.name, JSON.stringify(args), context.signal);

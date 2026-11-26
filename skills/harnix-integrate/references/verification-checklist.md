@@ -7,7 +7,8 @@
 
 2. **包安装与构建验证**
    - 宿主 `npm run typecheck`、`npm run build` 通过。
-   - 若使用 `vendor/harnix/*.tgz` 与 `Dockerfile`，确认 `package.json` 的 `overrides` 覆盖全部 `@harnix/*` 子包，且 `Dockerfile` 在 `npm ci` 前拷贝 `vendor/harnix`。
+   - 若使用 `vendor/harnix/*.tgz` 与 `Dockerfile`，确认 `package.json` 的 `overrides` 覆盖全部 `@harnix/*` 子包，且多阶段 `Dockerfile` 在安装根 `package.json` 的 stage 的 `npm ci` 前拷贝 `vendor/harnix`。
+   - 若数据库会话表存在 `agent_kind` `CHECK` 约束，确认已通过增量迁移放宽为包含 `'pi'`。
 
 3. **设置体系与安全红线测试**
    - `GET /api/v1/harness/descriptors` 返回 `native`、`pi`、`acp` 描述符。

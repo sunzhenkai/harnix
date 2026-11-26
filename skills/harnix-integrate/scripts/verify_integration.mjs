@@ -97,24 +97,31 @@ async function main() {
     }
   }
 
-  // 2. Dockerfile vendor check
+  // 2. Dockerfile vendor check (stage-aware for multi-stage Dockerfiles)
   const dockerfilePath = path.join(hostDir, 'Dockerfile');
   if (await fileExists(dockerfilePath)) {
     const df = await fs.readFile(dockerfilePath, 'utf8');
     if (usesVendor) {
-      const copyIdx = df.indexOf('vendor/harnix');
-      const ciIdx = df.indexOf('npm ci');
-      if (copyIdx < 0 || (ciIdx >= 0 && copyIdx > ciIdx)) {
+      const stages = df.split(/^FROM\s+/mu).slice(1);
+      const vendorStages = stages.filter((s) => s.includes('vendor/harnix'));
+      if (vendorStages.length === 0) {
         checks.push({
           id: 'dockerfile_vendor',
           status: 'fail',
           message: 'Dockerfile must COPY vendor/harnix before RUN npm ci',
         });
       } else {
+        const allValid = vendorStages.every((stage) => {
+          const copyIdx = stage.indexOf('vendor/harnix');
+          const ciMatch = /\bnpm\s+(?:ci|install)\b/u.exec(stage);
+          return ciMatch === null || copyIdx < ciMatch.index;
+        });
         checks.push({
           id: 'dockerfile_vendor',
-          status: 'pass',
-          message: 'Dockerfile copies vendor/harnix before npm ci',
+          status: allValid ? 'pass' : 'fail',
+          message: allValid
+            ? 'Dockerfile copies vendor/harnix before npm ci in build stage'
+            : 'Dockerfile stage with vendor/harnix must COPY it before RUN npm ci/install',
         });
       }
     } else {
@@ -164,6 +171,30 @@ async function main() {
       id: 'backend_three_kinds',
       status: 'pass',
       message: 'Backend supports native/pi/acp and harness probe/descriptors',
+    });
+  }
+
+  // 4b. Database agent_kind CHECK constraint check (if SQL CHECK exists)
+  const hasAgentKindCheck = /agent_kind\b[^;\n]*\bCHECK\s*\(/iu.test(combinedSrc);
+  if (hasAgentKindCheck) {
+    const allowsPi = /CHECK\s*\(\s*agent_kind\s+IN\s*\([^)]*'pi'[^)]*\)\s*\)/iu.test(combinedSrc);
+    checks.push({
+      id: 'db_agent_kind_constraint',
+      status: allowsPi ? 'pass' : 'fail',
+      message: allowsPi
+        ? "Database agent_kind CHECK constraint includes 'pi'"
+        : "Database agent_kind CHECK constraint found without 'pi'; add migration to allow ('native','pi','acp')",
+    });
+  }
+
+  // 4c. Legacy runtime cleanup warning
+  const hasLegacyRuntimeDir = await fileExists(path.join(hostDir, 'src', 'agentruntime'));
+  const hasLegacyAcpJsonRpc = await fileExists(path.join(hostDir, 'src', 'acp', 'jsonrpc.ts'));
+  if (hasLegacyRuntimeDir || hasLegacyAcpJsonRpc) {
+    checks.push({
+      id: 'legacy_runtime_cleanup',
+      status: 'warn',
+      message: 'Legacy src/agentruntime or src/acp/jsonrpc.ts still present; verify cleanup if migrating',
     });
   }
 

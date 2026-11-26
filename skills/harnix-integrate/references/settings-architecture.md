@@ -32,3 +32,6 @@
 2. **会话级切换器**：
    - 在对话页面（如顶部或输入区工具栏）展示当前会话使用的 Harness 实现；支持在 `native` / `pi` / `acp` 之间切换（选 `acp` 时联动选择具体启用的 ACP Agent）。
    - 若数据库会话表存在 `agent_kind` 的 `CHECK` 约束，务必新增迁移将其扩展为包含 `'pi'`（`CHECK (agent_kind IN ('native','pi','acp'))`）。
+3. **宿主 UI 规范与严格 TypeScript 兼容**：
+   - **严守宿主设计体系**：优先复用宿主既有表面/布局原语（如 `Section`、`Panel`、`Rows`、`Inline`、`Stack`、`SettingRow`），避免在页面代码手写 `gap-*` / `p-*` 等布局类触发设计系统 ESLint 规则。
+   - **兼容 `exactOptionalPropertyTypes: true`**：调用更新会话或设置的 patch API 时，对可选字段使用条件展开（`...(v !== undefined ? { k: v } : {})`），避免显式传入 `undefined`。

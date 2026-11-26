@@ -55,4 +55,5 @@
 
 - **`Unsupported URL Type "workspace:"`**：直接引用了未打包的 `harnix` 源码目录而非 `pack-tarballs.mjs` 产物。
 - **404 `@harnix/core` Not Found**：宿主 `package.json` 缺少 `overrides` 映射，npm 尝试从公共源下载传递依赖。
-- **Docker `npm ci` 找不到 `.tgz`**：`COPY vendor/harnix` 必须放在 `RUN npm ci` 之前。
+- **Docker `npm ci` 找不到 `.tgz`**：`COPY vendor/harnix` 必须放在 `RUN npm ci` 之前；在多阶段 `Dockerfile`（如前端 `web-build` + 后端 `build`）中，应放在后端安装根 `package.json` 的那个 stage 的 `RUN npm ci` 之前。
+- **首次 `npm install` 缓存权限**：首次解析 `@harnix/pi` 的传递依赖（如 `@mariozechner/pi-ai`）并生成 `package-lock.json` 时，需确保 `~/.npm` 缓存可写；lockfile 生成后，`npm ci` 与 Docker 构建可完全离线自包含执行。

@@ -3,6 +3,7 @@ import {
   type HarnessMessage,
   type HarnessTool,
   type HarnessToolCall,
+  type HarnessToolChoice,
   type HarnessUsage,
 } from '@harnix/core';
 import { parseSseStream } from './sse.js';
@@ -28,6 +29,9 @@ export interface NativeModelTurnInput {
   readonly messages: readonly HarnessMessage[];
   readonly tools: readonly HarnessTool[];
   readonly signal: AbortSignal;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly toolChoice?: HarnessToolChoice;
   readonly onTextDelta: (text: string) => Promise<void> | void;
   readonly onThoughtDelta: (text: string) => Promise<void> | void;
 }
@@ -165,37 +169,57 @@ async function assertOkResponse(response: Response, provider: NativeProviderKind
 export async function invokeOpenAiCompatibleTurn(input: NativeModelTurnInput): Promise<NativeModelTurnResult> {
   const fetchFn = input.config.fetchFn ?? fetch;
   const url = normalizeOpenAiEndpoint(input.config.baseUrl);
+  const temperature = input.temperature ?? input.config.temperature;
+  const maxTokens = input.maxTokens ?? input.config.maxTokens;
+  const apiKey = input.config.apiKey.trim();
 
-  const body: Record<string, unknown> = {
-    model: input.config.model,
-    messages: toOpenAiMessages(input.systemPrompt, input.messages),
-    stream: true,
-    ...(input.config.includeUsage !== false ? { stream_options: { include_usage: true } } : {}),
-    ...(input.config.temperature !== undefined ? { temperature: input.config.temperature } : {}),
-    ...(input.config.maxTokens !== undefined ? { max_tokens: input.config.maxTokens } : {}),
+  const buildBody = (includeToolChoice: boolean): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+      model: input.config.model,
+      messages: toOpenAiMessages(input.systemPrompt, input.messages),
+      stream: true,
+      ...(input.config.includeUsage !== false ? { stream_options: { include_usage: true } } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+    };
+
+    if (input.tools.length > 0) {
+      body['tools'] = input.tools.map((tool) => ({
+        type: 'function',
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+        },
+      }));
+      if (includeToolChoice && input.toolChoice) {
+        body['tool_choice'] = input.toolChoice;
+      }
+    }
+    return body;
   };
 
-  if (input.tools.length > 0) {
-    body['tools'] = input.tools.map((tool) => ({
-      type: 'function',
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: tool.parameters,
-      },
-    }));
-  }
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...input.config.headers,
+  };
 
-  const response = await fetchFn(url, {
+  let response = await fetchFn(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${input.config.apiKey}`,
-      ...input.config.headers,
-    },
-    body: JSON.stringify(body),
+    headers,
+    body: JSON.stringify(buildBody(true)),
     signal: input.signal,
   });
+
+  if (response.status === 400 && input.tools.length > 0 && input.toolChoice) {
+    response = await fetchFn(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(buildBody(false)),
+      signal: input.signal,
+    });
+  }
 
   await assertOkResponse(response, 'openai-compatible');
   if (!response.body) {
@@ -274,35 +298,57 @@ export async function invokeAnthropicTurn(input: NativeModelTurnInput): Promise<
   const url = normalizeAnthropicEndpoint(input.config.baseUrl);
   const converted = toAnthropicMessages(input.messages);
   const system = [input.systemPrompt, ...converted.systemParts].filter(Boolean).join('\n\n');
+  const temperature = input.temperature ?? input.config.temperature;
+  const maxTokens = input.maxTokens ?? input.config.maxTokens ?? 4096;
+  const apiKey = input.config.apiKey.trim();
 
-  const body: Record<string, unknown> = {
-    model: input.config.model,
-    max_tokens: input.config.maxTokens ?? 4096,
-    messages: converted.messages,
-    stream: true,
-    ...(system ? { system } : {}),
-    ...(input.config.temperature !== undefined ? { temperature: input.config.temperature } : {}),
+  const buildBody = (includeToolChoice: boolean): Record<string, unknown> => {
+    const body: Record<string, unknown> = {
+      model: input.config.model,
+      max_tokens: maxTokens,
+      messages: converted.messages,
+      stream: true,
+      ...(system ? { system } : {}),
+      ...(temperature !== undefined ? { temperature } : {}),
+    };
+
+    if (input.tools.length > 0) {
+      body['tools'] = input.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.parameters,
+      }));
+      if (includeToolChoice && input.toolChoice) {
+        body['tool_choice'] = {
+          type: input.toolChoice === 'required' ? 'any' : input.toolChoice,
+        };
+      }
+    }
+    return body;
   };
 
-  if (input.tools.length > 0) {
-    body['tools'] = input.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.parameters,
-    }));
-  }
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    ...(apiKey ? { 'x-api-key': apiKey } : {}),
+    'anthropic-version': '2023-06-01',
+    ...input.config.headers,
+  };
 
-  const response = await fetchFn(url, {
+  let response = await fetchFn(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': input.config.apiKey,
-      'anthropic-version': '2023-06-01',
-      ...input.config.headers,
-    },
-    body: JSON.stringify(body),
+    headers,
+    body: JSON.stringify(buildBody(true)),
     signal: input.signal,
   });
+
+  if (response.status === 400 && input.tools.length > 0 && input.toolChoice) {
+    response = await fetchFn(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(buildBody(false)),
+      signal: input.signal,
+    });
+  }
 
   await assertOkResponse(response, 'anthropic');
   if (!response.body) {

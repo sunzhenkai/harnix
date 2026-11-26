@@ -29,8 +29,12 @@ import type { AcpDecodedEvent } from './events.js';
 
 export interface AcpHarnessOptions {
   readonly agent: AcpAgentSpawnConfig;
+  readonly maxConcurrentSessions?: number;
+  readonly restartOnPreTokenFailure?: boolean;
   readonly endpointFactory?: (config: AcpAgentSpawnConfig) => AcpEndpoint;
 }
+
+const DEFAULT_MAX_CONCURRENT_SESSIONS = 4;
 
 interface AcpConnectionState {
   readonly client: AcpClient;
@@ -75,10 +79,22 @@ export class AcpHarness implements Harness {
   };
 
   private readonly endpointFactory: (config: AcpAgentSpawnConfig) => AcpEndpoint;
+  private readonly maxConcurrentSessions: number;
+  private readonly restartOnPreTokenFailure: boolean;
   private readonly connections = new Map<string, AcpConnectionState>();
 
   constructor(private readonly options: AcpHarnessOptions) {
     this.endpointFactory = options.endpointFactory ?? spawnAcpProcess;
+    this.maxConcurrentSessions =
+      options.maxConcurrentSessions && options.maxConcurrentSessions > 0
+        ? options.maxConcurrentSessions
+        : DEFAULT_MAX_CONCURRENT_SESSIONS;
+    this.restartOnPreTokenFailure = options.restartOnPreTokenFailure ?? true;
+  }
+
+  hasSessionCapacity(sessionId?: string): boolean {
+    if (sessionId && this.connections.has(sessionId)) return true;
+    return this.connections.size < this.maxConcurrentSessions;
   }
 
   async run(request: HarnessRunRequest, runOptions: HarnessRunOptions = {}): Promise<HarnessRunResult> {
@@ -88,7 +104,8 @@ export class AcpHarness implements Harness {
 
     const runId = request.runId ?? createRunId('acp');
     const emitter = new HarnessEventEmitter(runId, request.sessionId, runOptions.onEvent);
-    const { signal, cleanup } = combineSignals(runOptions.signal, request.limits?.timeoutMs);
+    const effectiveTimeoutMs = request.limits?.timeoutMs ?? this.options.agent.promptTimeoutMs;
+    const { signal, cleanup } = combineSignals(runOptions.signal, effectiveTimeoutMs);
 
     const ephemeral = request.sessionId === undefined;
     let conn: AcpConnectionState | undefined;
@@ -97,117 +114,162 @@ export class AcpHarness implements Harness {
       await emitter.emit({ type: 'run.started', harnessId: this.capabilities.id });
 
       const targetCwd = request.cwd ?? this.options.agent.cwd;
-      conn = request.sessionId
-        ? await this.getOrCreateConnection(request.sessionId, targetCwd, signal)
-        : await this.openConnection(targetCwd, signal);
+      const runAttempt = async (): Promise<{
+        text: string;
+        thinking: string;
+        usage: HarnessUsage;
+        rawStopReason: string;
+        hasToken: boolean;
+      }> => {
+        conn = request.sessionId
+          ? await this.getOrCreateConnection(request.sessionId, targetCwd, signal)
+          : await this.openConnection(targetCwd, signal);
 
-      const promptText = conn.historyReplayed
-        ? request.input
-        : formatHistoryPrompt(request.systemPrompt, request.history, request.input);
-      conn.historyReplayed = true;
+        const promptText = conn.historyReplayed
+          ? request.input
+          : formatHistoryPrompt(request.systemPrompt, request.history, request.input);
+        conn.historyReplayed = true;
 
-      let text = '';
-      let thinking = '';
-      let usage: HarnessUsage = { turns: 1, toolCalls: 0 };
-      const pendingEvents: Promise<unknown>[] = [];
+        let text = '';
+        let thinking = '';
+        let hasToken = false;
+        let usage: HarnessUsage = { turns: 1, toolCalls: 0 };
+        const pendingEvents: Promise<unknown>[] = [];
 
-      const enqueueEmit = (p: Promise<unknown>) => {
-        pendingEvents.push(p);
-      };
+        const enqueueEmit = (p: Promise<unknown>) => {
+          pendingEvents.push(p);
+        };
 
-      const onAcpEvent = (event: AcpDecodedEvent) => {
-        if (event.kind === 'message' && event.text) {
-          text += event.text;
-          enqueueEmit(emitter.emit({ type: 'text.delta', text: event.text }));
-        } else if (event.kind === 'thought' && event.text) {
-          thinking += event.text;
-          enqueueEmit(emitter.emit({ type: 'thought.delta', text: event.text }));
-        } else if (event.kind === 'tool_call') {
-          usage = { ...usage, toolCalls: (usage.toolCalls ?? 0) + 1 };
-          enqueueEmit(
-            emitter.emit({
-              type: 'tool.started',
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              title: event.toolTitle || undefined,
-              input: event.toolRawInput,
-            }),
-          );
-        } else if (event.kind === 'tool_call_update') {
-          if (event.toolStatus === 'completed' || event.toolStatus === 'failed') {
-            const output =
-              typeof event.toolRawOutput === 'string'
-                ? event.toolRawOutput
-                : event.toolRawOutput !== undefined
-                  ? JSON.stringify(event.toolRawOutput)
-                  : event.toolStatus;
+        const onAcpEvent = (event: AcpDecodedEvent) => {
+          if (event.kind === 'message' && event.text) {
+            hasToken = true;
+            text += event.text;
+            enqueueEmit(emitter.emit({ type: 'text.delta', text: event.text }));
+          } else if (event.kind === 'thought' && event.text) {
+            thinking += event.text;
+            enqueueEmit(emitter.emit({ type: 'thought.delta', text: event.text }));
+          } else if (event.kind === 'tool_call') {
+            usage = { ...usage, toolCalls: (usage.toolCalls ?? 0) + 1 };
             enqueueEmit(
               emitter.emit({
-                type: 'tool.completed',
+                type: 'tool.started',
                 toolCallId: event.toolCallId,
                 toolName: event.toolName,
-                content: output,
-                isError: event.toolStatus === 'failed',
-              }),
-            );
-          } else {
-            enqueueEmit(
-              emitter.emit({
-                type: 'tool.updated',
-                toolCallId: event.toolCallId,
-                toolName: event.toolName,
-                status: event.toolStatus || undefined,
                 title: event.toolTitle || undefined,
-                output: event.toolRawOutput,
+                input: event.toolRawInput,
               }),
             );
+          } else if (event.kind === 'tool_call_update') {
+            if (event.toolStatus === 'completed' || event.toolStatus === 'failed') {
+              const output =
+                typeof event.toolRawOutput === 'string'
+                  ? event.toolRawOutput
+                  : event.toolRawOutput !== undefined
+                    ? JSON.stringify(event.toolRawOutput)
+                    : event.toolStatus;
+              enqueueEmit(
+                emitter.emit({
+                  type: 'tool.completed',
+                  toolCallId: event.toolCallId,
+                  toolName: event.toolName,
+                  content: output,
+                  isError: event.toolStatus === 'failed',
+                }),
+              );
+            } else {
+              enqueueEmit(
+                emitter.emit({
+                  type: 'tool.updated',
+                  toolCallId: event.toolCallId,
+                  toolName: event.toolName,
+                  status: event.toolStatus || undefined,
+                  title: event.toolTitle || undefined,
+                  output: event.toolRawOutput,
+                }),
+              );
+            }
+          } else if (event.kind === 'plan') {
+            enqueueEmit(emitter.emit({ type: 'plan.updated', entries: event.plan }));
+          } else if (event.kind === 'usage' && event.usage) {
+            usage = { ...usage, ...event.usage };
+            enqueueEmit(emitter.emit({ type: 'usage.updated', usage }));
           }
-        } else if (event.kind === 'plan') {
-          enqueueEmit(emitter.emit({ type: 'plan.updated', entries: event.plan }));
-        } else if (event.kind === 'usage' && event.usage) {
-          usage = { ...usage, ...event.usage };
-          enqueueEmit(emitter.emit({ type: 'usage.updated', usage }));
+        };
+
+        const onPermission = async (
+          permReq: Parameters<NonNullable<HarnessRunOptions['onPermission']>>[0],
+          permSignal: AbortSignal,
+        ) => {
+          await emitter.emit({ type: 'permission.requested', request: permReq });
+          const handler = runOptions.onPermission ?? allowAllPermissions;
+          const decision = await handler(permReq, permSignal);
+          await emitter.emit({
+            type: 'permission.resolved',
+            requestId: permReq.requestId,
+            decision,
+          });
+          return decision;
+        };
+
+        try {
+          const rawStopReason = await conn.client.prompt(
+            conn.remoteSessionId,
+            promptText,
+            { onEvent: onAcpEvent, onPermission },
+            signal,
+          );
+          await Promise.all(pendingEvents);
+          return { text, thinking, usage, rawStopReason, hasToken };
+        } catch (err) {
+          await Promise.all(pendingEvents).catch(() => {});
+          if (hasToken) {
+            throw Object.assign(new Error('__POST_TOKEN_ERR__'), { cause: err });
+          }
+          throw err;
         }
       };
 
-      const onPermission = async (
-        permReq: Parameters<NonNullable<HarnessRunOptions['onPermission']>>[0],
-        permSignal: AbortSignal,
-      ) => {
-        await emitter.emit({ type: 'permission.requested', request: permReq });
-        const handler = runOptions.onPermission ?? allowAllPermissions;
-        const decision = await handler(permReq, permSignal);
-        await emitter.emit({
-          type: 'permission.resolved',
-          requestId: permReq.requestId,
-          decision,
-        });
-        return decision;
-      };
-
-      const rawStopReason = await conn.client.prompt(
-        conn.remoteSessionId,
-        promptText,
-        { onEvent: onAcpEvent, onPermission },
-        signal,
-      );
-      await Promise.all(pendingEvents);
+      let outcome: Awaited<ReturnType<typeof runAttempt>>;
+      try {
+        outcome = await runAttempt();
+      } catch (firstErr) {
+        if (firstErr instanceof Error && firstErr.message === '__POST_TOKEN_ERR__') {
+          throw firstErr.cause;
+        }
+        if (this.restartOnPreTokenFailure && request.sessionId && !signal.aborted) {
+          runOptions.onDebug?.({
+            step: 'acp_turn',
+            phase: 'acp_process_restart',
+            message: 'ACP process restarted after pre-token failure',
+            payload: { error: firstErr instanceof Error ? firstErr.message : String(firstErr) },
+          });
+          await this.closeSession(request.sessionId).catch(() => {});
+          outcome = await runAttempt().catch((retryErr) => {
+            if (retryErr instanceof Error && retryErr.message === '__POST_TOKEN_ERR__') {
+              throw retryErr.cause;
+            }
+            throw retryErr;
+          });
+        } else {
+          throw firstErr;
+        }
+      }
 
       const result: HarnessRunResult = {
         runId,
         ...(request.sessionId !== undefined ? { sessionId: request.sessionId } : {}),
-        text,
-        ...(thinking ? { thinking } : {}),
-        stopReason: mapAcpStopReason(rawStopReason),
+        text: outcome.text,
+        ...(outcome.thinking ? { thinking: outcome.thinking } : {}),
+        stopReason: mapAcpStopReason(outcome.rawStopReason),
         messages: [
           { role: 'user', content: request.input },
           {
             role: 'assistant',
-            content: text,
-            ...(thinking ? { thinking } : {}),
+            content: outcome.text,
+            ...(outcome.thinking ? { thinking: outcome.thinking } : {}),
           },
         ],
-        usage,
+        usage: outcome.usage,
       };
       await emitter.emit({ type: 'run.completed', result });
       return result;
@@ -296,7 +358,7 @@ export class AcpHarness implements Harness {
     await Promise.all(entries.map(([, conn]) => conn.client.close().catch(() => {})));
   }
 
-  private async closeSession(sessionId: string): Promise<void> {
+  async closeSession(sessionId: string): Promise<void> {
     const conn = this.connections.get(sessionId);
     if (!conn) return;
     this.connections.delete(sessionId);
@@ -313,6 +375,12 @@ export class AcpHarness implements Harness {
       if (existing.client.isAlive()) return existing;
       this.connections.delete(sessionId);
       await existing.client.close().catch(() => {});
+    }
+    if (this.connections.size >= this.maxConcurrentSessions) {
+      throw new HarnixError('BUDGET_EXHAUSTED', 'ACP agent concurrency limit reached', {
+        retryable: true,
+        details: { code: 'concurrency_limit', maxConcurrentSessions: this.maxConcurrentSessions },
+      });
     }
     const created = await this.openConnection(cwd, signal);
     this.connections.set(sessionId, created);
@@ -332,17 +400,23 @@ export class AcpHarness implements Harness {
       idleTimeoutMs: this.options.agent.idleTimeoutMs,
       clientInfo: this.options.agent.clientInfo,
     });
+    const { signal: initSignal, cleanup: cleanupInit } = combineSignals(
+      signal,
+      this.options.agent.initTimeoutMs,
+    );
     try {
-      await client.initialize(signal);
+      await client.initialize(initSignal);
       const remoteSessionId = await client.newSession(
         cwd ?? process.cwd(),
         this.options.agent.mcpServers ?? [],
-        signal,
+        initSignal,
       );
       return { client, remoteSessionId, historyReplayed: false };
     } catch (error) {
       await client.close().catch(() => {});
       throw error;
+    } finally {
+      cleanupInit();
     }
   }
 }

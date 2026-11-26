@@ -2,13 +2,20 @@ import { describe, expect, it } from 'vitest';
 import {
   assertCapabilities,
   AsyncEventQueue,
+  createPermissionHandlerForMode,
+  createPolicyPermissionHandler,
+  defaultHarnixSettings,
   HarnixError,
   InMemoryHarnessSession,
   isHarnixError,
+  normalizeHarnixSettings,
+  redactAcpAgents,
+  runToolLoop,
   streamFromRun,
   toHarnixError,
   type Harness,
   type HarnessCapabilities,
+  type HarnessDebugEvent,
   type HarnessEvent,
   HarnessEventEmitter,
 } from './index.js';
@@ -109,5 +116,127 @@ describe('@harnix/core', () => {
     const iter = queue[Symbol.asyncIterator]();
     expect(await iter.next()).toEqual({ value: 1, done: false });
     await expect(iter.next()).rejects.toThrow('boom');
+  });
+
+  it('normalizes and validates HarnixSettings with ACP security invariants', () => {
+    const defaults = defaultHarnixSettings();
+    expect(defaults.defaultKind).toBe('native');
+    expect(normalizeHarnixSettings()).toEqual(defaults);
+
+    expect(() =>
+      normalizeHarnixSettings({
+        acp: {
+          agents: {
+            bad: { id: 'bad', name: 'Bad', command: 'claude', env: { SECRET: '1' } },
+          },
+        },
+      }),
+    ).toThrowError(HarnixError);
+
+    expect(() =>
+      normalizeHarnixSettings({
+        acp: {
+          agents: {
+            bad: { id: 'bad', name: 'Bad', command: 'claude', args: ['--api-key', 'sk-123'] },
+          },
+        },
+      }),
+    ).toThrowError(HarnixError);
+
+    expect(() =>
+      normalizeHarnixSettings({
+        acp: {
+          defaults: { readonlyOnly: true },
+          agents: {
+            bad: { id: 'bad', name: 'Bad', command: 'claude', permission: { allowWrite: true } },
+          },
+        },
+      }),
+    ).toThrowError(HarnixError);
+
+    const valid = normalizeHarnixSettings({
+      defaultKind: 'pi',
+      pi: { reasoning: true, contextWindow: 65536 },
+      acp: {
+        defaultAgentId: 'claude',
+        agents: {
+          claude: {
+            id: 'claude',
+            name: 'Claude Code',
+            enabled: true,
+            command: 'claude',
+            envPassthrough: ['PATH', 'CUSTOM_VAR_1'],
+          },
+        },
+      },
+    });
+    expect(valid.pi.reasoning).toBe(true);
+    const redacted = redactAcpAgents(valid.acp, { PATH: '/usr/bin' });
+    expect(redacted[0]?.envPassthrough).toEqual([
+      { name: 'PATH', present: true },
+      { name: 'CUSTOM_VAR_1', present: false },
+    ]);
+  });
+
+  it('enforces policy permissions and runToolLoop per-turn limits & onDebug', async () => {
+    const readonlyHandler = createPermissionHandlerForMode('readonly');
+    const signal = new AbortController().signal;
+    expect((await readonlyHandler({ requestId: '1', toolName: 'search_docs' }, signal)).outcome).toBe('allow');
+    expect((await readonlyHandler({ requestId: '2', toolName: 'write_file' }, signal)).outcome).toBe('deny');
+
+    const customHandler = createPolicyPermissionHandler({
+      allowRead: true,
+      allowSearch: false,
+      allowFetch: false,
+      allowWrite: true,
+      allowExecute: false,
+      readonlyOnly: false,
+    });
+    expect((await customHandler({ requestId: '3', toolName: 'edit_page' }, signal)).outcome).toBe('allow');
+
+    const debugEvents: HarnessDebugEvent[] = [];
+    const executed: string[] = [];
+    let turn = 0;
+    const result = await runToolLoop({
+      harnessId: 'test',
+      defaultMaxToolCallsPerTurn: 1,
+      request: {
+        input: 'run tools',
+        temperature: 0.2,
+        maxTokens: 512,
+        toolChoice: 'required',
+        tools: [
+          { name: 't1', description: 't1', parameters: {}, execute: () => (executed.push('t1'), { content: 'r1' }) },
+          { name: 't2', description: 't2', parameters: {}, execute: () => (executed.push('t2'), { content: 'r2' }) },
+        ],
+      },
+      options: {
+        onDebug: (ev) => debugEvents.push(ev),
+      },
+      invokeTurn: async (ctx) => {
+        turn += 1;
+        expect(ctx.temperature).toBe(0.2);
+        expect(ctx.maxTokens).toBe(512);
+        expect(ctx.toolChoice).toBe('required');
+        if (turn === 1) {
+          return {
+            text: '',
+            thinking: '',
+            toolCalls: [
+              { id: 'c1', name: 't1', arguments: {} },
+              { id: 'c2', name: 't2', arguments: {} },
+            ],
+            usage: {},
+            truncated: false,
+          };
+        }
+        return { text: 'done', thinking: '', toolCalls: [], usage: {}, truncated: false };
+      },
+    });
+
+    expect(result.text).toBe('done');
+    expect(executed).toEqual(['t1']);
+    expect(debugEvents.some((e) => e.phase === 'tool_calls_truncated')).toBe(true);
+    expect(debugEvents.some((e) => e.phase === 'tool_result')).toBe(true);
   });
 });

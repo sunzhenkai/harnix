@@ -1,0 +1,24 @@
+{
+  "name": "harnix",
+  "version": "0.1.0",
+  "type": "module",
+  "files": ["dist"],
+  "description": "Aggregate entry package for @harnix/core, @harnix/native, @harnix/pi, and @harnix/acp.",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@harnix/core": "workspace:*",
+    "@harnix/native": "workspace:*",
+    "@harnix/pi": "workspace:*",
+    "@harnix/acp": "workspace:*"
+  },
+  "scripts": {
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc -p tsconfig.json"
+  }
+}

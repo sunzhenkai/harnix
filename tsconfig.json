@@ -5,6 +5,7 @@
     { "path": "packages/native" },
     { "path": "packages/pi" },
     { "path": "packages/acp" },
+    { "path": "packages/harnix" },
     { "path": "packages/cli" }
   ]
 }

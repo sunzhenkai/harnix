@@ -28,6 +28,7 @@ export interface NativeHarnessOptions {
   readonly defaultTools?: readonly HarnessTool[];
   readonly maxTurns?: number;
   readonly maxToolCalls?: number;
+  readonly maxToolCallsPerTurn?: number;
   readonly invoker?: NativeTurnInvoker;
 }
 
@@ -63,15 +64,19 @@ export class NativeHarness implements Harness {
       defaultTools: this.options.defaultTools,
       defaultMaxTurns: this.options.maxTurns,
       defaultMaxToolCalls: this.options.maxToolCalls,
+      defaultMaxToolCallsPerTurn: this.options.maxToolCallsPerTurn,
       request,
       options: runOptions,
-      invokeTurn: ({ signal, onTextDelta, onThoughtDelta }) =>
+      invokeTurn: ({ signal, temperature, maxTokens, toolChoice, onTextDelta, onThoughtDelta }) =>
         this.invoker({
           config: this.options.provider,
           systemPrompt: request.systemPrompt,
           messages: conversation,
           tools,
           signal,
+          temperature,
+          maxTokens,
+          toolChoice,
           onTextDelta,
           onThoughtDelta,
         }),

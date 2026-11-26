@@ -2,8 +2,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isHarnixError, type HarnessEvent } from '@harnix/core';
-import { AcpHarness } from './index.js';
+import { isHarnixError, type HarnessDebugEvent, type HarnessEvent } from '@harnix/core';
+import { AcpHarness, probeAcpAgent } from './index.js';
 
 const MOCK_ACP_SCRIPT = `
 import readline from 'node:readline';
@@ -221,5 +221,77 @@ describe('@harnix/acp', () => {
     } finally {
       await harness.close();
     }
+  });
+
+  it('enforces maxConcurrentSessions, supports closeSession/hasSessionCapacity, and probes ACP agent', async () => {
+    const { agentFile } = await writeMockAgent();
+    const probe = await probeAcpAgent({ command: process.execPath, args: [agentFile] });
+    expect(probe.ok).toBe(true);
+    expect(probe.agentName).toBe('mock-acp-agent');
+
+    const harness = new AcpHarness({
+      maxConcurrentSessions: 1,
+      agent: {
+        command: process.execPath,
+        args: [agentFile],
+        envPassthrough: ['PATH'],
+      },
+    });
+
+    expect(harness.hasSessionCapacity('s1')).toBe(true);
+    await harness.run({ sessionId: 's1', input: 'hello' });
+    expect(harness.hasSessionCapacity('s1')).toBe(true);
+    expect(harness.hasSessionCapacity('s2')).toBe(false);
+
+    await expect(harness.run({ sessionId: 's2', input: 'blocked' })).rejects.toThrowError(/concurrency limit/);
+
+    await harness.closeSession('s1');
+    expect(harness.hasSessionCapacity('s2')).toBe(true);
+    await harness.close();
+  });
+
+  it('restarts ACP session once on pre-token failure and emits debug event', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'harnix-acp-restart-'));
+    tempDirs.push(dir);
+    const flagFile = path.join(dir, 'restarted.flag');
+    const flakyScript = path.join(dir, 'flaky-agent.mjs');
+    await fs.writeFile(
+      flakyScript,
+      `
+import fs from 'node:fs';
+import readline from 'node:readline';
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+function send(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentInfo: { name: 'flaky', version: '1.0' } } });
+  } else if (msg.method === 'session/new') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'rs_1' } });
+  } else if (msg.method === 'session/prompt') {
+    if (!fs.existsSync(${JSON.stringify(flagFile)})) {
+      fs.writeFileSync(${JSON.stringify(flagFile)}, '1');
+      process.exit(1);
+    }
+    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'rs_1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'recovered' } } } });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+  }
+});
+`,
+      'utf8',
+    );
+
+    const harness = new AcpHarness({
+      agent: { command: process.execPath, args: [flakyScript] },
+    });
+    const debugEvents: HarnessDebugEvent[] = [];
+    const res = await harness.run(
+      { sessionId: 'flaky_s1', input: 'hi' },
+      { onDebug: (e) => debugEvents.push(e) },
+    );
+    expect(res.text).toBe('recovered');
+    expect(debugEvents.some((e) => e.phase === 'acp_process_restart')).toBe(true);
+    await harness.close();
   });
 });

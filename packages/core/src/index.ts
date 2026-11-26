@@ -3,3 +3,5 @@ export * from './events.js';
 export * from './types.js';
 export * from './helpers.js';
 export * from './loop.js';
+export * from './permissions.js';
+export * from './config.js';

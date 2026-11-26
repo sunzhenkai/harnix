@@ -103,9 +103,12 @@ export interface HarnessUsage {
 export interface HarnessRunLimits {
   readonly maxTurns?: number;
   readonly maxToolCalls?: number;
+  readonly maxToolCallsPerTurn?: number;
   readonly maxTokens?: number;
   readonly timeoutMs?: number;
 }
+
+export type HarnessToolChoice = 'auto' | 'required' | 'none';
 
 export interface HarnessRunRequest {
   readonly runId?: string;
@@ -116,15 +119,27 @@ export interface HarnessRunRequest {
   readonly history?: readonly HarnessMessage[];
   readonly tools?: readonly HarnessTool[];
   readonly limits?: HarnessRunLimits;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly toolChoice?: HarnessToolChoice;
   readonly metadata?: Record<string, unknown>;
 }
 
+export interface HarnessDebugEvent {
+  readonly step: string;
+  readonly phase: string;
+  readonly message: string;
+  readonly payload?: Record<string, unknown>;
+}
+
 export type HarnessEventListener = (event: HarnessEvent) => void | Promise<void>;
+export type HarnessDebugListener = (event: HarnessDebugEvent) => void;
 
 export interface HarnessRunOptions {
   readonly signal?: AbortSignal;
   readonly onEvent?: HarnessEventListener;
   readonly onPermission?: PermissionHandler;
+  readonly onDebug?: HarnessDebugListener;
 }
 
 export type HarnessStopReason =

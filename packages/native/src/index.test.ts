@@ -153,4 +153,51 @@ describe('@harnix/native', () => {
       events.some((e) => e.type === 'tool.completed' && e.isError === true && e.content === 'blocked by policy'),
     ).toBe(true);
   });
+
+  it('omits Authorization when apiKey is empty and retries without tool_choice on HTTP 400', async () => {
+    const authHeaders: Array<string | undefined> = [];
+    const bodies: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+
+    const srv = await startServer((req, body, res) => {
+      attempt += 1;
+      authHeaders.push(req.headers['authorization']);
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      bodies.push(parsed);
+
+      if (attempt === 1) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'tool_choice not supported' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'ollama ok' } }] })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    });
+    cleanups.push(srv.close);
+
+    const harness = new NativeHarness({
+      provider: {
+        kind: 'openai-compatible',
+        baseUrl: `${srv.url}/v1`,
+        apiKey: '',
+        model: 'llama3',
+      },
+    });
+
+    const result = await harness.run({
+      input: 'hi',
+      temperature: 0.3,
+      maxTokens: 256,
+      toolChoice: 'required',
+      tools: [{ name: 'ping', description: 'ping', parameters: { type: 'object' }, execute: () => ({ content: 'ok' }) }],
+    });
+
+    expect(result.text).toBe('ollama ok');
+    expect(authHeaders).toEqual([undefined, undefined]);
+    expect(bodies[0]?.['tool_choice']).toBe('required');
+    expect(bodies[1]?.['tool_choice']).toBeUndefined();
+    expect(bodies[1]?.['temperature']).toBe(0.3);
+    expect(bodies[1]?.['max_tokens']).toBe(256);
+  });
 });

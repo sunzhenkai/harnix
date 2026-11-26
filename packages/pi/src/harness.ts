@@ -42,6 +42,8 @@ export interface PiTurnInput {
   readonly route: PiModelRoute;
   readonly context: Context;
   readonly signal: AbortSignal;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
   readonly onTextDelta: (text: string) => Promise<void> | void;
   readonly onThoughtDelta: (text: string) => Promise<void> | void;
 }
@@ -62,6 +64,7 @@ export interface PiHarnessOptions {
   readonly defaultTools?: readonly HarnessTool[];
   readonly maxTurns?: number;
   readonly maxToolCalls?: number;
+  readonly maxToolCallsPerTurn?: number;
   readonly invoker?: PiTurnInvoker;
 }
 
@@ -152,13 +155,16 @@ export const defaultPiTurnInvoker: PiTurnInvoker = async ({
   route,
   context,
   signal,
+  temperature,
+  maxTokens,
   onTextDelta,
   onThoughtDelta,
 }) => {
   const model = buildPiModel(route);
   const eventStream = piStream(model, context, {
     apiKey: route.apiKey,
-    maxTokens: route.maxTokens ?? 4_096,
+    maxTokens: maxTokens ?? route.maxTokens ?? 4_096,
+    ...(temperature !== undefined ? { temperature } : {}),
     signal,
   });
 
@@ -259,9 +265,10 @@ export class PiHarness implements Harness {
       defaultTools: this.options.defaultTools,
       defaultMaxTurns: this.options.maxTurns,
       defaultMaxToolCalls: this.options.maxToolCalls,
+      defaultMaxToolCallsPerTurn: this.options.maxToolCallsPerTurn,
       request,
       options: runOptions,
-      invokeTurn: async ({ signal, onTextDelta, onThoughtDelta }) => {
+      invokeTurn: async ({ signal, temperature, maxTokens, onTextDelta, onThoughtDelta }) => {
         const result = await this.invoker({
           route: this.options.route,
           context: {
@@ -270,6 +277,8 @@ export class PiHarness implements Harness {
             ...(piTools.length > 0 ? { tools: piTools } : {}),
           },
           signal,
+          temperature,
+          maxTokens,
           onTextDelta,
           onThoughtDelta,
         });

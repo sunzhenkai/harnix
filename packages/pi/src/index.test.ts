@@ -160,4 +160,28 @@ describe('@harnix/pi', () => {
     expect(events.some((e) => e.type === 'tool.completed' && e.content === 'pi-live')).toBe(true);
     expect(events.some((e) => e.type === 'text.delta' && e.text.includes('Pi answered'))).toBe(true);
   });
+
+  it('forwards request-level temperature and maxTokens to Pi invoker', async () => {
+    let seenTemp: number | undefined;
+    let seenMaxTokens: number | undefined;
+
+    const harness = new PiHarness({
+      route: {
+        adapterKind: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:9999/v1',
+        modelId: 'gpt-pi',
+        apiKey: 'sk-test',
+      },
+      invoker: async (input) => {
+        seenTemp = input.temperature;
+        seenMaxTokens = input.maxTokens;
+        return { text: 'ok', thinking: '', toolCalls: [], usage: {}, truncated: false };
+      },
+    });
+
+    const res = await harness.run({ input: 'hello', temperature: 0.15, maxTokens: 777 });
+    expect(res.text).toBe('ok');
+    expect(seenTemp).toBe(0.15);
+    expect(seenMaxTokens).toBe(777);
+  });
 });

@@ -14,12 +14,16 @@ import type {
   HarnessStopReason,
   HarnessTool,
   HarnessToolCall,
+  HarnessToolChoice,
   HarnessUsage,
 } from './types.js';
 
 export interface ToolLoopTurnContext {
   readonly turn: number;
   readonly signal: AbortSignal;
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly toolChoice?: HarnessToolChoice;
   readonly onTextDelta: (text: string) => Promise<void>;
   readonly onThoughtDelta: (text: string) => Promise<void>;
 }
@@ -38,6 +42,7 @@ export interface ToolLoopConfig {
   readonly defaultTools?: readonly HarnessTool[];
   readonly defaultMaxTurns?: number;
   readonly defaultMaxToolCalls?: number;
+  readonly defaultMaxToolCallsPerTurn?: number;
   readonly request: HarnessRunRequest;
   readonly options?: HarnessRunOptions;
   readonly invokeTurn: (ctx: ToolLoopTurnContext) => Promise<ToolLoopTurnOutput>;
@@ -68,7 +73,9 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
   const toolMap = new Map(tools.map((t) => [t.name, t]));
   const maxTurns = request.limits?.maxTurns ?? config.defaultMaxTurns ?? DEFAULT_MAX_TURNS;
   const maxToolCalls = request.limits?.maxToolCalls ?? config.defaultMaxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
+  const maxToolCallsPerTurn = request.limits?.maxToolCallsPerTurn ?? config.defaultMaxToolCallsPerTurn;
   const onPermission = runOptions.onPermission ?? allowAllPermissions;
+  const onDebug = runOptions.onDebug;
 
   const generatedMessages: HarnessMessage[] = [{ role: 'user', content: request.input }];
 
@@ -91,15 +98,43 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
         break;
       }
       turns += 1;
+      const stepName = `round_${turns - 1}`;
+      onDebug?.({
+        step: stepName,
+        phase: 'llm_request',
+        message: `${stepName} LLM request`,
+        payload: {
+          turn: turns,
+          tools_count: tools.length,
+          ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+          ...(request.maxTokens !== undefined ? { max_tokens: request.maxTokens } : {}),
+          ...(request.toolChoice !== undefined ? { tool_choice: request.toolChoice } : {}),
+        },
+      });
 
       const turnResult = await config.invokeTurn({
         turn: turns,
         signal,
+        temperature: request.temperature,
+        maxTokens: request.maxTokens,
+        toolChoice: request.toolChoice,
         onTextDelta: async (delta) => {
           await emitter.emit({ type: 'text.delta', text: delta });
         },
         onThoughtDelta: async (delta) => {
           await emitter.emit({ type: 'thought.delta', text: delta });
+        },
+      });
+
+      onDebug?.({
+        step: stepName,
+        phase: 'llm_response',
+        message: `${stepName} LLM response`,
+        payload: {
+          turn: turns,
+          text_chars: turnResult.text.length,
+          tool_calls_count: turnResult.toolCalls.length,
+          truncated: turnResult.truncated,
         },
       });
 
@@ -117,11 +152,27 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
       finalText = turnResult.text;
       if (turnResult.thinking) finalThinking += turnResult.thinking;
 
+      const effectiveToolCalls =
+        maxToolCallsPerTurn !== undefined &&
+        maxToolCallsPerTurn > 0 &&
+        turnResult.toolCalls.length > maxToolCallsPerTurn
+          ? turnResult.toolCalls.slice(0, maxToolCallsPerTurn)
+          : turnResult.toolCalls;
+
+      if (effectiveToolCalls.length < turnResult.toolCalls.length) {
+        onDebug?.({
+          step: stepName,
+          phase: 'tool_calls_truncated',
+          message: `Truncated tool calls from ${turnResult.toolCalls.length} to ${effectiveToolCalls.length}`,
+          payload: { max_tool_calls_per_turn: maxToolCallsPerTurn },
+        });
+      }
+
       const assistantMsg: HarnessMessage = {
         role: 'assistant',
         content: turnResult.text,
         ...(turnResult.thinking ? { thinking: turnResult.thinking } : {}),
-        ...(turnResult.toolCalls.length > 0 ? { toolCalls: turnResult.toolCalls } : {}),
+        ...(effectiveToolCalls.length > 0 ? { toolCalls: effectiveToolCalls } : {}),
       };
       generatedMessages.push(assistantMsg);
       config.onAssistantMessage?.(assistantMsg);
@@ -131,12 +182,12 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
         break;
       }
 
-      if (turnResult.toolCalls.length === 0) {
+      if (effectiveToolCalls.length === 0) {
         stopReason = turnResult.truncated ? 'max_tokens' : 'completed';
         break;
       }
 
-      for (const call of turnResult.toolCalls) {
+      for (const call of effectiveToolCalls) {
         throwIfAborted(signal);
         if (totalToolCalls >= maxToolCalls) {
           throw new HarnixError('BUDGET_EXHAUSTED', `Exceeded maxToolCalls limit (${maxToolCalls})`);
@@ -168,6 +219,12 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
           };
           generatedMessages.push(toolMsg);
           config.onToolMessage?.(toolMsg);
+          onDebug?.({
+            step: stepName,
+            phase: 'tool_result',
+            message: `${call.name} denied`,
+            payload: { tool_name: call.name, denied: true, reason: denialContent },
+          });
           await emitter.emit({
             type: 'tool.completed',
             toolCallId: call.id,
@@ -186,6 +243,7 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
         });
 
         const tool = toolMap.get(call.name);
+        const toolStartedAt = Date.now();
         let content: string;
         let isError = false;
         if (!tool) {
@@ -205,6 +263,19 @@ export async function runToolLoop(config: ToolLoopConfig): Promise<HarnessRunRes
             isError = true;
           }
         }
+        const durationMs = Date.now() - toolStartedAt;
+
+        onDebug?.({
+          step: stepName,
+          phase: 'tool_result',
+          message: `${call.name} executed`,
+          payload: {
+            tool_name: call.name,
+            duration_ms: durationMs,
+            is_error: isError,
+            result_chars: content.length,
+          },
+        });
 
         const toolMsg: HarnessMessage = {
           role: 'tool',

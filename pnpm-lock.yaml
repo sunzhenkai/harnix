@@ -41,6 +41,21 @@ importers:
 
   packages/core: {}
 
+  packages/harnix:
+    dependencies:
+      '@harnix/acp':
+        specifier: workspace:*
+        version: link:../acp
+      '@harnix/core':
+        specifier: workspace:*
+        version: link:../core
+      '@harnix/native':
+        specifier: workspace:*
+        version: link:../native
+      '@harnix/pi':
+        specifier: workspace:*
+        version: link:../pi
+
   packages/native:
     dependencies:
       '@harnix/core':

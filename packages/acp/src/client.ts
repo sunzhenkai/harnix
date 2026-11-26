@@ -1,7 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { constants } from 'node:fs';
+import { access } from 'node:fs/promises';
 import path from 'node:path';
 import {
   allowAllPermissions,
+  combineSignals,
   HarnixError,
   type PermissionDecision,
   type PermissionHandler,
@@ -14,8 +17,11 @@ export interface AcpAgentSpawnConfig {
   readonly command: string;
   readonly args?: readonly string[];
   readonly env?: Record<string, string>;
+  readonly envPassthrough?: readonly string[];
   readonly cwd?: string;
   readonly mcpServers?: readonly unknown[];
+  readonly initTimeoutMs?: number;
+  readonly promptTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
   readonly clientInfo?: {
     readonly name: string;
@@ -54,10 +60,39 @@ function waitWithCancel(ms: number): { promise: Promise<'timeout'>; cancel: () =
   };
 }
 
+function buildSpawnEnv(config: AcpAgentSpawnConfig): NodeJS.ProcessEnv {
+  if (!config.envPassthrough) {
+    return { ...process.env, ...config.env };
+  }
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of config.envPassthrough) {
+    const val = process.env[key];
+    if (val !== undefined) env[key] = val;
+  }
+  return { ...env, ...config.env };
+}
+
+function terminateChildProcess(child: ChildProcess, signalName: NodeJS.Signals): void {
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, signalName);
+      return;
+    } catch {
+      // Fall back to direct child kill if process group already exited
+    }
+  }
+  try {
+    child.kill(signalName);
+  } catch {
+    // ignore
+  }
+}
+
 export function spawnAcpProcess(config: AcpAgentSpawnConfig): AcpEndpoint {
   const child: ChildProcess = spawn(config.command, [...(config.args ?? [])], {
     cwd: config.cwd ?? process.cwd(),
-    env: { ...process.env, ...config.env },
+    env: buildSpawnEnv(config),
+    detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -102,16 +137,112 @@ export function spawnAcpProcess(config: AcpAgentSpawnConfig): AcpEndpoint {
       grace.cancel();
 
       if (res === 'timeout' && !exited && child.exitCode === null) {
-        child.kill('SIGTERM');
+        terminateChildProcess(child, 'SIGTERM');
         const killWait = waitWithCancel(1000);
         const res2 = await Promise.race([waitDone.then(() => 'done' as const), killWait.promise]);
         killWait.cancel();
         if (res2 === 'timeout' && !exited && child.exitCode === null) {
-          child.kill('SIGKILL');
+          terminateChildProcess(child, 'SIGKILL');
         }
       }
     },
   };
+}
+
+export interface AcpProbeResult {
+  readonly ok: boolean;
+  readonly code: 'ok' | 'cli_not_found' | 'spawn_failed' | 'initialize_failed' | 'protocol_version_unsupported';
+  readonly message: string;
+  readonly agentName?: string;
+  readonly agentVersion?: string;
+  readonly protocolVersion?: number;
+}
+
+/**
+ * Resolves whether an executable command exists and is executable in PATH or as an explicit path.
+ */
+export async function lookPath(command: string): Promise<string | null> {
+  const value = command.trim();
+  if (!value) return null;
+  if (value.includes('/') || value.includes(path.sep)) {
+    try {
+      await access(value, constants.X_OK);
+      return value;
+    } catch {
+      return null;
+    }
+  }
+  const search = process.env['PATH'] ?? '';
+  for (const dir of search.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, value);
+    try {
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // keep searching
+    }
+  }
+  return null;
+}
+
+/**
+ * Probes an ACP agent executable by checking PATH, spawning the process, and running `initialize`.
+ */
+export async function probeAcpAgent(
+  config: AcpAgentSpawnConfig,
+  signal?: AbortSignal,
+): Promise<AcpProbeResult> {
+  const found = await lookPath(config.command);
+  if (!found) {
+    return {
+      ok: false,
+      code: 'cli_not_found',
+      message: `Command '${config.command}' not found in PATH`,
+    };
+  }
+
+  let endpoint: AcpEndpoint;
+  try {
+    endpoint = spawnAcpProcess(config);
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'spawn_failed',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+
+  const timeoutMs = Math.min(config.initTimeoutMs ?? 30_000, 15_000);
+  const { signal: initSignal, cleanup } = combineSignals(signal, timeoutMs);
+  const client = new AcpClient(endpoint, {
+    idleTimeoutMs: config.idleTimeoutMs,
+    clientInfo: config.clientInfo,
+  });
+
+  try {
+    const init = await client.initialize(initSignal);
+    return {
+      ok: true,
+      code: 'ok',
+      message: 'Connected',
+      agentName: init.agentInfo?.name,
+      agentVersion: init.agentInfo?.version,
+      protocolVersion: init.protocolVersion,
+    };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    const isProto =
+      error instanceof HarnixError && error.code === 'ACP_PROTOCOL_ERROR' && msg.includes('protocolVersion');
+    return {
+      ok: false,
+      code: isProto ? 'protocol_version_unsupported' : 'initialize_failed',
+      message: msg,
+    };
+  } finally {
+    cleanup();
+    await client.close().catch(() => {});
+  }
 }
 
 interface ActivePrompt {

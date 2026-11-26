@@ -15,6 +15,7 @@ export interface AcpAgentSpawnConfig {
   readonly args?: readonly string[];
   readonly env?: Record<string, string>;
   readonly cwd?: string;
+  readonly mcpServers?: readonly unknown[];
   readonly idleTimeoutMs?: number;
   readonly clientInfo?: {
     readonly name: string;
@@ -37,6 +38,20 @@ export interface AcpPromptHandlers {
 export interface AcpEndpoint extends JsonRpcStreamEndpoint {
   close(): Promise<void>;
   stderrTail(): string;
+  isAlive?(): boolean;
+}
+
+function waitWithCancel(ms: number): { promise: Promise<'timeout'>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const promise = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), ms);
+  });
+  return {
+    promise,
+    cancel: () => {
+      if (timer !== undefined) clearTimeout(timer);
+    },
+  };
 }
 
 export function spawnAcpProcess(config: AcpAgentSpawnConfig): AcpEndpoint {
@@ -51,38 +66,49 @@ export function spawnAcpProcess(config: AcpAgentSpawnConfig): AcpEndpoint {
   }
 
   let stderrBuf = '';
+  let exited = false;
   child.stderr?.on('data', (chunk: Buffer) => {
     stderrBuf = (stderrBuf + chunk.toString('utf8')).slice(-4096);
   });
+  child.on('error', (err: Error) => {
+    exited = true;
+    stderrBuf = (stderrBuf + `\nspawn error: ${err.message}`).slice(-4096);
+  });
 
   const waitDone = new Promise<void>((resolve) => {
-    child.once('exit', () => resolve());
-    child.once('error', () => resolve());
+    child.once('exit', () => {
+      exited = true;
+      resolve();
+    });
+    child.once('error', () => {
+      exited = true;
+      resolve();
+    });
   });
 
   return {
     stdin: child.stdin,
     stdout: child.stdout,
     stderrTail: () => stderrBuf.trim(),
+    isAlive: () => !exited && child.exitCode === null && !child.killed,
     close: async () => {
       try {
         child.stdin?.end();
       } catch {
         // ignore
       }
-      const res = await Promise.race([
-        waitDone.then(() => 'done' as const),
-        new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 1500)),
-      ]);
-      if (res === 'timeout' && child.exitCode === null) {
+      const grace = waitWithCancel(1500);
+      const res = await Promise.race([waitDone.then(() => 'done' as const), grace.promise]);
+      grace.cancel();
+
+      if (res === 'timeout' && !exited && child.exitCode === null) {
         child.kill('SIGTERM');
-        await Promise.race([
-          waitDone,
-          new Promise<void>((r) => setTimeout(() => {
-            if (child.exitCode === null) child.kill('SIGKILL');
-            r();
-          }, 1000)),
-        ]);
+        const killWait = waitWithCancel(1000);
+        const res2 = await Promise.race([waitDone.then(() => 'done' as const), killWait.promise]);
+        killWait.cancel();
+        if (res2 === 'timeout' && !exited && child.exitCode === null) {
+          child.kill('SIGKILL');
+        }
       }
     },
   };
@@ -90,6 +116,7 @@ export function spawnAcpProcess(config: AcpAgentSpawnConfig): AcpEndpoint {
 
 interface ActivePrompt {
   readonly handlers: AcpPromptHandlers;
+  readonly signal?: AbortSignal;
   cancelled: boolean;
   waiters: Array<() => void>;
   onActivity: () => void;
@@ -123,6 +150,10 @@ export class AcpClient {
     this.conn.setRequestHandler((method, params) => this.handleRequest(method, params));
   }
 
+  isAlive(): boolean {
+    return this.endpoint.isAlive ? this.endpoint.isAlive() : true;
+  }
+
   async initialize(signal?: AbortSignal): Promise<AcpInitializeResult> {
     const result = (await this.conn.call(
       'initialize',
@@ -146,10 +177,14 @@ export class AcpClient {
     return result;
   }
 
-  async newSession(cwd: string, signal?: AbortSignal): Promise<string> {
+  async newSession(
+    cwd: string,
+    mcpServers: readonly unknown[] = [],
+    signal?: AbortSignal,
+  ): Promise<string> {
     const result = (await this.conn.call(
       'session/new',
-      { cwd: path.resolve(cwd), mcpServers: [] },
+      { cwd: path.resolve(cwd), mcpServers: [...mcpServers] },
       signal,
     )) as { sessionId?: string };
 
@@ -167,6 +202,7 @@ export class AcpClient {
   ): Promise<string> {
     const active: ActivePrompt = {
       handlers,
+      signal,
       cancelled: false,
       waiters: [],
       onActivity: () => {
@@ -180,6 +216,16 @@ export class AcpClient {
     };
     this.active.set(sessionId, active);
 
+    let onAbortListener: (() => void) | undefined;
+    const abortPromise: Promise<{ kind: 'abort' }> | undefined = signal
+      ? signal.aborted
+        ? Promise.resolve({ kind: 'abort' as const })
+        : new Promise<{ kind: 'abort' }>((resolve) => {
+            onAbortListener = () => resolve({ kind: 'abort' as const });
+            signal.addEventListener('abort', onAbortListener, { once: true });
+          })
+      : undefined;
+
     try {
       const outcomePromise = this.conn
         .call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] })
@@ -192,6 +238,7 @@ export class AcpClient {
         );
 
       while (true) {
+        const idle = waitWithCancel(this.idleTimeoutMs);
         const racers: Array<
           Promise<
             | { kind: 'outcome'; outcome: Awaited<typeof outcomePromise> }
@@ -202,24 +249,17 @@ export class AcpClient {
         > = [
           outcomePromise.then((outcome) => ({ kind: 'outcome' as const, outcome })),
           active.nextActivity().then(() => ({ kind: 'activity' as const })),
-          new Promise<{ kind: 'idle' }>((resolve) =>
-            setTimeout(() => resolve({ kind: 'idle' }), this.idleTimeoutMs),
-          ),
+          idle.promise.then(() => ({ kind: 'idle' as const })),
         ];
+        if (abortPromise) racers.push(abortPromise);
 
-        if (signal) {
-          if (signal.aborted) {
-            racers.push(Promise.resolve({ kind: 'abort' as const }));
-          } else {
-            racers.push(
-              new Promise<{ kind: 'abort' }>((resolve) => {
-                signal.addEventListener('abort', () => resolve({ kind: 'abort' }), { once: true });
-              }),
-            );
-          }
+        let race: Awaited<(typeof racers)[number]>;
+        try {
+          race = await Promise.race(racers);
+        } finally {
+          idle.cancel();
         }
 
-        const race = await Promise.race(racers);
         if (race.kind === 'activity') continue;
 
         if (race.kind === 'outcome') {
@@ -248,6 +288,9 @@ export class AcpClient {
         });
       }
     } finally {
+      if (signal && onAbortListener) {
+        signal.removeEventListener('abort', onAbortListener);
+      }
       if (this.active.get(sessionId) === active) {
         this.active.delete(sessionId);
       }
@@ -288,8 +331,10 @@ export class AcpClient {
       return { outcome: { outcome: 'cancelled' } };
     }
 
+    active.onActivity();
     const handler = active.handlers.onPermission ?? allowAllPermissions;
-    const decision = await handler(request, new AbortController().signal);
+    const decision = await handler(request, active.signal ?? new AbortController().signal);
+    active.onActivity();
     return toAcpPermissionResponse(decision, request);
   }
 }

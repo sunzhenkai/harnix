@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
-import { parseCliArgs, runCli } from './index.js';
+import { createCliPermissionHandler, parseCliArgs, runCli, StreamEventRenderer } from './index.js';
 
 describe('@harnix/cli', () => {
   const tempDirs: string[] = [];
@@ -23,6 +23,59 @@ describe('@harnix/cli', () => {
     expect(parsed.provider).toBe('anthropic');
     expect(parsed.apiKey).toBe('env-key');
     expect(parsed.prompt).toBe('hi');
+  });
+
+  it('groups contiguous thought deltas into a single [thought] block', () => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let out = '';
+    let err = '';
+    stdout.on('data', (c: Buffer) => {
+      out += c.toString('utf8');
+    });
+    stderr.on('data', (c: Buffer) => {
+      err += c.toString('utf8');
+    });
+
+    const renderer = new StreamEventRenderer(stdout, stderr);
+    const base = { runId: 'r1', timestamp: '2026-01-01T00:00:00Z' };
+    renderer.render({ ...base, sequence: 1, type: 'thought.delta', text: 'step 1 ' });
+    renderer.render({ ...base, sequence: 2, type: 'thought.delta', text: 'step 2' });
+    renderer.render({ ...base, sequence: 3, type: 'text.delta', text: 'Hello' });
+
+    expect(err).toBe('[thought] step 1 step 2\n');
+    expect(out).toBe('Hello');
+  });
+
+  it('denies permissions by default in non-interactive mode and prompts when interactive', async () => {
+    const stdin = new PassThrough();
+    const stderr = new PassThrough();
+
+    const nonInteractive = createCliPermissionHandler({
+      autoApprove: false,
+      interactive: false,
+      stdin,
+      stderr,
+    });
+    const denied = await nonInteractive(
+      { requestId: 'p1', toolName: 'shell' },
+      new AbortController().signal,
+    );
+    expect(denied.outcome).toBe('deny');
+
+    const interactiveHandler = createCliPermissionHandler({
+      autoApprove: false,
+      interactive: true,
+      stdin,
+      stderr,
+    });
+    const decisionPromise = interactiveHandler(
+      { requestId: 'p2', toolName: 'shell' },
+      new AbortController().signal,
+    );
+    stdin.write('y\n');
+    const allowed = await decisionPromise;
+    expect(allowed.outcome).toBe('allow');
   });
 
   it('runs single-prompt mode against an ACP agent process', async () => {
@@ -63,7 +116,7 @@ describe('@harnix/cli', () => {
 
     const code = await runCli(
       ['--harness', 'acp', '--acp-command', process.execPath, '--acp-arg', mockAgent, '-p', 'ping'],
-      { stdout, stderr },
+      { stdout, stderr, interactive: false },
     );
 
     expect(code).toBe(0);

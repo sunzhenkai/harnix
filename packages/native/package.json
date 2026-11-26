@@ -2,6 +2,7 @@
   "name": "@harnix/native",
   "version": "0.1.0",
   "type": "module",
+  "files": ["dist"],
   "description": "Hand-crafted fetch-based Harness supporting OpenAI-compatible and Anthropic APIs with streaming and tool loops.",
   "exports": {
     ".": {

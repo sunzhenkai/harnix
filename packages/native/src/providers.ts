@@ -16,6 +16,8 @@ export interface NativeProviderConfig {
   readonly model: string;
   readonly temperature?: number;
   readonly maxTokens?: number;
+  /** Whether to send `stream_options: { include_usage: true }` for OpenAI-compatible endpoints (default: true). */
+  readonly includeUsage?: boolean;
   readonly headers?: Record<string, string>;
   readonly fetchFn?: typeof fetch;
 }
@@ -168,7 +170,7 @@ export async function invokeOpenAiCompatibleTurn(input: NativeModelTurnInput): P
     model: input.config.model,
     messages: toOpenAiMessages(input.systemPrompt, input.messages),
     stream: true,
-    stream_options: { include_usage: true },
+    ...(input.config.includeUsage !== false ? { stream_options: { include_usage: true } } : {}),
     ...(input.config.temperature !== undefined ? { temperature: input.config.temperature } : {}),
     ...(input.config.maxTokens !== undefined ? { max_tokens: input.config.maxTokens } : {}),
   };

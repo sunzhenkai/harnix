@@ -2,6 +2,7 @@
   "name": "@harnix/cli",
   "version": "0.1.0",
   "type": "module",
+  "files": ["dist"],
   "description": "Example CLI demonstrating @harnix/core with Native, Pi, and ACP harnesses.",
   "bin": {
     "harnix": "./dist/bin.js"

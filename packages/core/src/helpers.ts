@@ -254,6 +254,7 @@ export class InMemoryHarnessSession implements HarnessSession {
   private buildRequest(input: string): HarnessRunRequest {
     return {
       sessionId: this.id,
+      ...(this.options.cwd !== undefined ? { cwd: this.options.cwd } : {}),
       input,
       systemPrompt: this.options.systemPrompt,
       history: this.messages,

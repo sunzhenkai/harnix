@@ -1,4 +1,4 @@
-import { createInterface } from 'node:readline/promises';
+import { createInterface, type Interface as ReadlineInterface } from 'node:readline/promises';
 import { AcpHarness } from '@harnix/acp';
 import {
   allowAllPermissions,
@@ -76,25 +76,109 @@ export function createHarnessFromOptions(options: CliOptions): Harness {
   });
 }
 
+/**
+ * Stateful stream renderer that groups contiguous thought chunks into a single `[thought]` block.
+ */
+export class StreamEventRenderer {
+  private inThought = false;
+  private hasText = false;
+
+  constructor(
+    private readonly stdout: NodeJS.WritableStream,
+    private readonly stderr: NodeJS.WritableStream,
+  ) {}
+
+  render(event: HarnessEvent): void {
+    if (event.type === 'thought.delta') {
+      if (!this.inThought) {
+        this.stderr.write('[thought] ');
+        this.inThought = true;
+      }
+      this.stderr.write(event.text);
+      return;
+    }
+
+    this.flushThought();
+
+    if (event.type === 'text.delta') {
+      this.hasText = true;
+      this.stdout.write(event.text);
+    } else if (event.type === 'tool.started') {
+      this.stderr.write(`${this.hasText ? '\n' : ''}[tool:start] ${event.toolName}\n`);
+    } else if (event.type === 'tool.completed') {
+      this.stderr.write(
+        `[tool:done] ${event.toolName} (${event.isError ? 'error' : 'ok'}): ${event.content}\n`,
+      );
+    } else if (event.type === 'plan.updated') {
+      const summary = event.entries.map((e) => `${e.status}: ${e.content}`).join(' | ');
+      this.stderr.write(`[plan] ${summary}\n`);
+    } else if (event.type === 'run.completed') {
+      this.stdout.write('\n');
+      this.hasText = false;
+    }
+  }
+
+  private flushThought(): void {
+    if (!this.inThought) return;
+    this.stderr.write('\n');
+    this.inThought = false;
+  }
+}
+
 export function renderEventToStreams(
   event: HarnessEvent,
   stdout: NodeJS.WritableStream,
   stderr: NodeJS.WritableStream,
 ): void {
-  if (event.type === 'text.delta') {
-    stdout.write(event.text);
-  } else if (event.type === 'thought.delta') {
-    stderr.write(`[thought] ${event.text}`);
-  } else if (event.type === 'tool.started') {
-    stderr.write(`\n[tool:start] ${event.toolName}\n`);
-  } else if (event.type === 'tool.completed') {
-    stderr.write(`[tool:done] ${event.toolName} (${event.isError ? 'error' : 'ok'}): ${event.content}\n`);
-  } else if (event.type === 'plan.updated') {
-    const summary = event.entries.map((e) => `${e.status}: ${e.content}`).join(' | ');
-    stderr.write(`[plan] ${summary}\n`);
-  } else if (event.type === 'run.completed') {
-    stdout.write('\n');
+  const renderer = new StreamEventRenderer(stdout, stderr);
+  renderer.render(event);
+}
+
+export function createCliPermissionHandler(params: {
+  readonly autoApprove: boolean;
+  readonly interactive: boolean;
+  readonly stdin: NodeJS.ReadableStream;
+  readonly stderr: NodeJS.WritableStream;
+  readonly getReadline?: () => ReadlineInterface | undefined;
+}): PermissionHandler {
+  if (params.autoApprove) {
+    return allowAllPermissions;
   }
+
+  return async (req) => {
+    const rejectOption = req.options?.find((o) => o.kind === 'reject_once')?.optionId;
+    if (!params.interactive) {
+      params.stderr.write(
+        `[permission:denied] Tool '${req.toolName}' denied in non-interactive mode (pass --auto-approve to allow)\n`,
+      );
+      return {
+        outcome: 'deny',
+        optionId: rejectOption,
+        reason: 'Denied in non-interactive mode (pass --auto-approve to allow)',
+      };
+    }
+
+    const existingRl = params.getReadline?.();
+    const rl = existingRl ?? createInterface({ input: params.stdin, output: params.stderr });
+    try {
+      const label = req.title || req.toolName;
+      const answer = await rl.question(`\n[permission] Allow "${label}"? [y/N] `);
+      const normalized = answer.trim().toLowerCase();
+      if (normalized === 'y' || normalized === 'yes') {
+        return {
+          outcome: 'allow',
+          optionId: req.options?.find((o) => o.kind === 'allow_once')?.optionId,
+        };
+      }
+      return {
+        outcome: 'deny',
+        optionId: rejectOption,
+        reason: 'Denied by user',
+      };
+    } finally {
+      if (!existingRl) rl.close();
+    }
+  };
 }
 
 export async function runCli(
@@ -104,11 +188,14 @@ export async function runCli(
     readonly stdout?: NodeJS.WritableStream;
     readonly stderr?: NodeJS.WritableStream;
     readonly env?: NodeJS.ProcessEnv;
+    readonly interactive?: boolean;
   } = {},
 ): Promise<number> {
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
   const stdin = io.stdin ?? process.stdin;
+  const interactive =
+    io.interactive ?? Boolean((stdin as NodeJS.ReadStream).isTTY && (stdout as NodeJS.WriteStream).isTTY);
 
   const options = parseCliArgs(argv, io.env ?? process.env);
   if (options.help) {
@@ -117,12 +204,15 @@ export async function runCli(
   }
 
   const harness = createHarnessFromOptions(options);
-  const onPermission: PermissionHandler = options.autoApprove
-    ? allowAllPermissions
-    : async (req) => ({
-        outcome: 'allow',
-        optionId: req.options?.find((o) => o.kind === 'allow_once')?.optionId,
-      });
+  const renderer = new StreamEventRenderer(stdout, stderr);
+  let activeRl: ReadlineInterface | undefined;
+  const onPermission = createCliPermissionHandler({
+    autoApprove: options.autoApprove,
+    interactive,
+    stdin,
+    stderr,
+    getReadline: () => activeRl,
+  });
 
   try {
     if (options.prompt !== undefined) {
@@ -130,7 +220,7 @@ export async function runCli(
         { input: options.prompt, systemPrompt: options.systemPrompt },
         { onPermission },
       )) {
-        renderEventToStreams(event, stdout, stderr);
+        renderer.render(event);
       }
       return 0;
     }
@@ -139,12 +229,12 @@ export async function runCli(
       ? await harness.createSession({ systemPrompt: options.systemPrompt })
       : undefined;
 
-    const rl = createInterface({ input: stdin, output: stdout });
+    activeRl = createInterface({ input: stdin, output: stdout });
     stdout.write(`harnix (${harness.capabilities.name}) — type /exit to quit, /history to inspect\n`);
 
     try {
       while (true) {
-        const line = await rl.question('> ');
+        const line = await activeRl.question('> ');
         const trimmed = line.trim();
         if (!trimmed) continue;
         if (trimmed === '/exit' || trimmed === '/quit') break;
@@ -159,11 +249,12 @@ export async function runCli(
           : harness.stream({ input: trimmed, systemPrompt: options.systemPrompt }, { onPermission });
 
         for await (const event of stream) {
-          renderEventToStreams(event, stdout, stderr);
+          renderer.render(event);
         }
       }
     } finally {
-      rl.close();
+      activeRl.close();
+      activeRl = undefined;
       await session?.close();
     }
     return 0;

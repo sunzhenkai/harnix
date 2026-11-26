@@ -2,6 +2,7 @@
   "name": "@harnix/core",
   "version": "0.1.0",
   "type": "module",
+  "files": ["dist"],
   "description": "Unified Agent Harness interfaces, events, tool/permission contracts, and runtime helpers.",
   "exports": {
     ".": {

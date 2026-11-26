@@ -2,6 +2,7 @@
   "name": "@harnix/acp",
   "version": "0.1.0",
   "type": "module",
+  "files": ["dist"],
   "description": "ACP (Agent Client Protocol) stdio JSON-RPC 2.0 adapter implementing the @harnix/core Harness interface.",
   "exports": {
     ".": {

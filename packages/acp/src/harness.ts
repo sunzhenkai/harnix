@@ -96,9 +96,10 @@ export class AcpHarness implements Harness {
     try {
       await emitter.emit({ type: 'run.started', harnessId: this.capabilities.id });
 
+      const targetCwd = request.cwd ?? this.options.agent.cwd;
       conn = request.sessionId
-        ? await this.getOrCreateConnection(request.sessionId, this.options.agent.cwd, signal)
-        : await this.openConnection(this.options.agent.cwd, signal);
+        ? await this.getOrCreateConnection(request.sessionId, targetCwd, signal)
+        : await this.openConnection(targetCwd, signal);
 
       const promptText = conn.historyReplayed
         ? request.input
@@ -247,6 +248,7 @@ export class AcpHarness implements Harness {
         const result = await this.run(
           {
             sessionId,
+            ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
             input,
             systemPrompt: options.systemPrompt,
             tools: options.tools,
@@ -267,6 +269,7 @@ export class AcpHarness implements Harness {
         for await (const ev of this.stream(
           {
             sessionId,
+            ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
             input,
             systemPrompt: options.systemPrompt,
             tools: options.tools,
@@ -306,7 +309,11 @@ export class AcpHarness implements Harness {
     signal: AbortSignal,
   ): Promise<AcpConnectionState> {
     const existing = this.connections.get(sessionId);
-    if (existing) return existing;
+    if (existing) {
+      if (existing.client.isAlive()) return existing;
+      this.connections.delete(sessionId);
+      await existing.client.close().catch(() => {});
+    }
     const created = await this.openConnection(cwd, signal);
     this.connections.set(sessionId, created);
     return created;
@@ -316,14 +323,22 @@ export class AcpHarness implements Harness {
     cwd: string | undefined,
     signal: AbortSignal,
   ): Promise<AcpConnectionState> {
-    const endpoint = this.endpointFactory(this.options.agent);
+    const spawnCfg: AcpAgentSpawnConfig = {
+      ...this.options.agent,
+      ...(cwd !== undefined ? { cwd } : {}),
+    };
+    const endpoint = this.endpointFactory(spawnCfg);
     const client = new AcpClient(endpoint, {
       idleTimeoutMs: this.options.agent.idleTimeoutMs,
       clientInfo: this.options.agent.clientInfo,
     });
     try {
       await client.initialize(signal);
-      const remoteSessionId = await client.newSession(cwd ?? process.cwd(), signal);
+      const remoteSessionId = await client.newSession(
+        cwd ?? process.cwd(),
+        this.options.agent.mcpServers ?? [],
+        signal,
+      );
       return { client, remoteSessionId, historyReplayed: false };
     } catch (error) {
       await client.close().catch(() => {});

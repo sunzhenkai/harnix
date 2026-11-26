@@ -110,6 +110,7 @@ export interface HarnessRunLimits {
 export interface HarnessRunRequest {
   readonly runId?: string;
   readonly sessionId?: string;
+  readonly cwd?: string;
   readonly input: string;
   readonly systemPrompt?: string;
   readonly history?: readonly HarnessMessage[];

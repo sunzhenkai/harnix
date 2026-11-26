@@ -1,8 +1,37 @@
-import { describe, expect, it } from 'vitest';
+import http from 'node:http';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { HarnessEvent, HarnessTool } from '@harnix/core';
 import { buildPiModel, PiHarness, toPiMessages, toPiTools } from './index.js';
 
+function startMockOpenAiServer(
+  handler: (body: string, res: http.ServerResponse) => void,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => handler(Buffer.concat(chunks).toString('utf8'), res));
+    });
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (!addr || typeof addr === 'string') throw new Error('expected TCP address');
+      resolve({
+        url: `http://127.0.0.1:${addr.port}`,
+        close: () => new Promise((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
 describe('@harnix/pi', () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    while (cleanups.length > 0) {
+      await cleanups.pop()!();
+    }
+  });
+
   it('maps routes, messages, and tools to Pi AI structures', () => {
     const model = buildPiModel({
       adapterKind: 'anthropic',
@@ -26,45 +55,98 @@ describe('@harnix/pi', () => {
     expect(piTools[0]?.name).toBe('ping');
   });
 
-  it('executes multi-turn tool loop and streams unified events', async () => {
-    let step = 0;
-    const harness = new PiHarness({
-      route: {
-        adapterKind: 'openai-compatible',
-        baseUrl: 'https://api.example.com/v1',
-        modelId: 'gpt-pi',
-        apiKey: 'sk-test',
-      },
-      invoker: async ({ onTextDelta, onThoughtDelta }) => {
-        step += 1;
-        if (step === 1) {
-          await onThoughtDelta('thinking...');
-          return {
-            text: '',
-            thinking: 'thinking...',
-            toolCalls: [{ id: 'tc_1', name: 'echo', arguments: { msg: 'hello' } }],
-            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-            truncated: false,
-          };
-        }
-        await onTextDelta('Final: ');
-        await onTextDelta('hello');
-        return {
-          text: 'Final: hello',
-          thinking: '',
-          toolCalls: [],
-          usage: { inputTokens: 15, outputTokens: 5, totalTokens: 20 },
-          truncated: false,
-        };
-      },
+  it('executes real defaultPiTurnInvoker through @mariozechner/pi-ai against a mock OpenAI SSE server', async () => {
+    let callCount = 0;
+    const srv = await startMockOpenAiServer((body, res) => {
+      callCount += 1;
+      const parsed = JSON.parse(body) as { messages: Array<{ role: string; content: unknown }> };
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+
+      if (callCount === 1) {
+        res.write(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl-1',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: 'gpt-pi-live',
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: 'assistant',
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_pi_1',
+                      type: 'function',
+                      function: { name: 'echo', arguments: '{"msg":"pi-live"}' },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`,
+        );
+        res.write(
+          `data: ${JSON.stringify({
+            id: 'chatcmpl-1',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: 'gpt-pi-live',
+            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+            usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+          })}\n\n`,
+        );
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
+      const toolMsg = parsed.messages.find((m) => m.role === 'tool');
+      const reply = `Pi answered: ${String(toolMsg?.content ?? '')}`;
+      res.write(
+        `data: ${JSON.stringify({
+          id: 'chatcmpl-2',
+          object: 'chat.completion.chunk',
+          created: 2,
+          model: 'gpt-pi-live',
+          choices: [{ index: 0, delta: { role: 'assistant', content: reply }, finish_reason: null }],
+        })}\n\n`,
+      );
+      res.write(
+        `data: ${JSON.stringify({
+          id: 'chatcmpl-2',
+          object: 'chat.completion.chunk',
+          created: 2,
+          model: 'gpt-pi-live',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 15, completion_tokens: 5, total_tokens: 20 },
+        })}\n\n`,
+      );
+      res.end('data: [DONE]\n\n');
     });
+    cleanups.push(srv.close);
 
     const echoTool: HarnessTool = {
       name: 'echo',
       description: 'Echo message',
-      parameters: { type: 'object' },
+      parameters: {
+        type: 'object',
+        properties: { msg: { type: 'string' } },
+        required: ['msg'],
+      },
       execute: (args) => ({ content: String(args['msg'] ?? '') }),
     };
+
+    // No custom invoker: exercises the real defaultPiTurnInvoker + @mariozechner/pi-ai stream()
+    const harness = new PiHarness({
+      route: {
+        adapterKind: 'openai-compatible',
+        baseUrl: `${srv.url}/v1`,
+        modelId: 'gpt-pi-live',
+        apiKey: 'sk-test',
+      },
+    });
 
     const events: HarnessEvent[] = [];
     for await (const event of harness.stream({ input: 'run echo', tools: [echoTool] })) {
@@ -72,9 +154,10 @@ describe('@harnix/pi', () => {
     }
 
     const completed = events.find((e) => e.type === 'run.completed');
-    expect(completed?.type === 'run.completed' && completed.result.text).toBe('Final: hello');
-    expect(completed?.type === 'run.completed' && completed.result.usage.totalTokens).toBe(35);
-    expect(events.some((e) => e.type === 'thought.delta' && e.text === 'thinking...')).toBe(true);
-    expect(events.some((e) => e.type === 'tool.completed' && e.content === 'hello')).toBe(true);
+    expect(completed?.type === 'run.completed' && completed.result.text).toBe('Pi answered: pi-live');
+    expect(completed?.type === 'run.completed' && completed.result.usage.turns).toBe(2);
+    expect(completed?.type === 'run.completed' && completed.result.usage.toolCalls).toBe(1);
+    expect(events.some((e) => e.type === 'tool.completed' && e.content === 'pi-live')).toBe(true);
+    expect(events.some((e) => e.type === 'text.delta' && e.text.includes('Pi answered'))).toBe(true);
   });
 });
